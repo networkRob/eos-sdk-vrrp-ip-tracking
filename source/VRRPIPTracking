@@ -185,7 +185,7 @@ class IPMON(eossdk.AgentHandler,eossdk.TimeoutHandler, eossdk.VrfHandler, eossdk
                     old = self.POLL_TIME,
                     new = DEFAULT_POLL
                 ))
-                self.POLL_TIME = 10
+                self.POLL_TIME = DEFAULT_POLL
         elif optionName.lower() == 'vrf':
             if value:
                 if self.VRFMgr_.exists(value):
