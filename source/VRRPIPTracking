@@ -1,0 +1,559 @@
+#!/usr/bin/python
+
+# Copyright (c) 2022, Arista Networks, Inc.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#  - Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#  - Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution.
+#  - Neither the name of Arista Networks nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL ARISTA NETWORKS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+# BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+# OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+# IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# eos-sdk-vrrp-ip-tracking
+#
+#    Written by:
+#       Rob Martin, Arista Networks
+#
+"""
+This EOS SDK script will monitor ICMP reachability to configured IPs 
+If certain amount of failures occur, it will set the VRRP priority
+level for the local node.
+"""
+
+import ipaddress
+import eossdk
+import syslog
+import sys
+import time
+import json
+from subprocess import call, PIPE, Popen
+
+__author__ = 'robmartin'
+__version__ = '0.1.0'
+
+ALL_DEVICES = {}
+ALL_VLANS = {}
+DEFAULT_MASTER = 110
+DEFAULT_STANDBY = 90
+DEFAULT_VRF = "default"
+DEFAULT_DELAY = 4
+DEFAULT_THRESHOLD = 3
+DEFAULT_POLL = 5
+
+
+class DEVICEMON():
+    def __init__(self,d_name,d_ip):
+        self.device = d_name
+        self.ip = d_ip
+        self.first_fail = ''
+        self.first_success = ''
+        self.failed = 0
+        self.success = 0
+        self.status_msg = ''
+    
+    def increase_failure(self):
+        self.failed += 1
+
+    def increase_success(self):
+        self.success += 1
+
+    def set_success(self):
+        self.first_success = time.ctime()
+    
+    def set_failure(self):
+        self.first_fail = time.ctime()
+    
+    def set_msg(self,msg):
+        self.status_msg = msg
+    
+    def del_msg(self):
+        self.status_msg = ''
+
+    def reset_failed(self):
+        self.failed = 0
+
+    def reset_success(self):
+        self.success = 0
+
+# Create class for VLAN/VRRP config
+class VRRPNODE():
+    def __init__(self, vlan_id, vrrp_id, master_priority, standby_priority, current_status, vrf):
+        self.vlan_id = vlan_id
+        self.vrrp_id = vrrp_id
+        self.master = master_priority
+        self.standby = standby_priority
+        self.status = current_status
+        self.vrf = vrf
+
+class IPMON(eossdk.AgentHandler,eossdk.TimeoutHandler, eossdk.VrfHandler, eossdk.EapiMgr):
+    def __init__(self,agentMgr, vrfMgr, eapiMgr):
+        eossdk.AgentHandler.__init__(self,agentMgr)
+        eossdk.TimeoutHandler.__init__(self,sdk.get_timeout_mgr())
+        eossdk.VrfHandler.__init__(self, vrfMgr)
+        self.tracer = eossdk.Tracer("EosSdkIPMonitor")
+        self.agentMgr_ = agentMgr
+        self.vrfMgr_ = vrfMgr
+        self.eapiMgr_ = eapiMgr
+        self.tracer.trace0("Constructed")
+        self.PING_THRESHOLD = DEFAULT_THRESHOLD #Default for failed ping attempts
+        self.POLL_TIME = DEFAULT_POLL #Default for timeout between pings in seconds
+        self.VRF = DEFAULT_VRF #Default VRF if it has not been configured on the switch
+        self.MASTER = DEFAULT_MASTER
+        self.STANDBY = DEFAULT_STANDBY
+        self.intf = '' #Interface to source pings from
+    
+    def on_initialized(self): 
+        self.tracer.trace0("We are initialized!")
+        self.agentMgr_.status_set("VRF", str(self.VRF))
+        self.agentMgr_.status_set("Master-Priority", str(self.MASTER))
+        self.agentMgr_.status_set("Standby-Priority", str(self.STANDBY))
+        self._to_syslog("Agent STARTED", "VRRP IP Tracking Agent Initialized")
+        for _option in self.agentMgr_.agent_option_iter():
+            self.opt_name = _option
+            self.opt_value = self.agentMgr_.agent_option(_option)
+            self.on_agent_option(self.opt_name,self.opt_value)
+        self.on_timeout()
+
+    def _ping_host(self,host):
+        #Function to ping the IP address to locate
+        vrf_commands = ['sudo','ip','netns','exec']
+        base_commands = ['ping','-c1','-w1']
+        if self.intf:
+            base_commands = base_commands + ['-I%s'%self.intf]
+        base_commands = base_commands + [host]
+        if self.VRF != 'default':
+            vrf_commands.append(self.VRF)
+            ping_commands = vrf_commands + base_commands
+        else:
+            ping_commands = base_commands
+        try:
+            p_host = call(ping_commands,stdout=PIPE,stderr=PIPE)
+        except:
+            p_host = 6
+        return(p_host)
+    
+    def _remove_status(self,rem_device):
+        #Function to remove the old status and device from list
+        if ALL_DEVICES:
+            if rem_device in ALL_DEVICES:
+                _current_device = ALL_DEVICES[rem_device]
+                self.agentMgr_.status_del(_current_device.status_msg)
+                ALL_DEVICES.pop(rem_device)
+            
+    def on_agent_option(self,optionName, value):
+        #First check to see if options will override the defaults
+        if optionName.lower() == 'threshold':
+            if value:
+                self._to_syslog("INFO", "Ping Threshold value changed from {old} to {new}".format(
+                    old = self.PING_THRESHOLD,
+                    new = value
+                ))
+                self.PING_THRESHOLD = int(value)
+            else:
+                self._to_syslog("INFO", "Ping Threshold value changed from {old} to {new}".format(
+                    old = self.PING_THRESHOLD,
+                    new = DEFAULT_THRESHOLD
+                ))
+                self.PING_THRESHOLD = DEFAULT_THRESHOLD
+        elif optionName.lower() == 'poll':
+            if value:
+                self._to_syslog("INFO", "Polling interval value changed from {old} to {new}".format(
+                    old = self.POLL_TIME,
+                    new = value
+                ))
+                self.POLL_TIME = int(value)
+            else:
+                self._to_syslog("INFO", "Polling interval value changed from {old} to {new}".format(
+                    old = self.POLL_TIME,
+                    new = DEFAULT_POLL
+                ))
+                self.POLL_TIME = 10
+        elif optionName.lower() == 'vrf':
+            if value:
+                if self.VRFMgr_.exists(value):
+                    self._to_syslog("INFO", "VRF {vrf} is already available and configured.".format(
+                        vrf = value
+                    ))
+                    self._to_syslog("INFO", "VRF value changed from %s to %s"%(self.VRF,value))
+                    if 'ns-' not in value:
+                        value = 'ns-' + value
+                    self.VRF = value
+                else:
+                    self._to_syslog("INFO", "VRF {vrf} is not configured on this device. Please configure it first.".format(
+                        vrf = value
+                    ))
+            else:
+                self._to_syslog("INFO", "VRF value changed from {old} to {new}".format(
+                    old = self.VRF,
+                    new = DEFAULT_VRF
+                ))
+                self.VRF = DEFAULT_VRF
+        elif optionName.lower() == 'source':
+            if value:
+                self._to_syslog("INFO", "Source Interface value changed from {old} to {new}".format(
+                    old = self.intf,
+                    new = value
+                ))
+                self.intf = value
+            else:
+                self._to_syslog("INFO", "Source Interface value defaulted from {old} to None".format(
+                    old = self.intf
+                ))
+                self.intf = ''
+        # Check if vlan is in option name
+        elif "vlan" in optionName.lower():
+            _vlan_id = optionName.lower()
+            if value:
+                if _vlan_id in ALL_VLANS:
+                    if ALL_VLANS[_vlan_id].vrrp_id != value:
+                        self._to_syslog("INFO", "VRRP ID for {vlan} has changed from {old_id} to {new_id}".format(
+                            vlan = _vlan_id.replace("vlan", ""),
+                            old_id = ALL_VLANS[_vlan_id].vrrp_id,
+                            new_id = value
+                        ))
+                        ALL_VLANS[_vlan_id].vrrp_id = value
+                    else:
+                        self._to_syslog("INFO", "VLAN {vlan} is already available and configured.".format(
+                            vlan = _vlan_id.replace("vlan", "")
+                        ))
+                else:
+                    status = self.get_vrrp_status(_vlan_id, value)
+                    if not status:
+                        status = "Not Active"
+                    self.agentMgr_.status_set(_vlan_id, status)
+                    self._to_syslog("INFO", "VRRP for VLAN {vlan} is currently {status}".format(
+                        vlan = _vlan_id.replace("vlan", ""),
+                        status = status
+                    ))
+                    ALL_VLANS[_vlan_id] = VRRPNODE(_vlan_id, value, self.MASTER, self.STANDBY, status, self.VRF)
+            else:
+                self._to_syslog("INFO", "Removing VLAN {vlan} from Route Tracking".format(
+                    vlan = _vlan_id.replace("vlan", "")
+                ))
+                self.agentMgr_.status_del(_vlan_id)
+                ALL_VLANS.pop(_vlan_id)
+        elif optionName.lower() == "master":
+            if value:
+                try:
+                    value = int(value)
+                except ValueError:
+                    self._to_syslog("Option Error", "The value for {name} is not of type integer, {value}".format(
+                        name = optionName,
+                        value = value
+                    ))
+                if type(value) == int:
+                    if value != self.MASTER:
+                        if value > self.STANDBY:
+                            self._to_syslog("INFO", "Master priofity level {master} is higher than current standby level {standby}".format(
+                                master = value,
+                                standby = self.STANDBY
+                            ))
+                            self._to_syslog("Master Level Update", "Master priority value is being updated from {old} to {new}".format(
+                                old = self.MASTER,
+                                new = value
+                            ))
+                            self.MASTER = value
+                            self.agentMgr_.status_set("Master-Priority", str(self.MASTER))
+                        else:
+                            self._to_syslog("MASTER LEVEL INFO", "The configured master level priority {master} is lower than the current standby of {lower}".format(
+                                master = value,
+                                lower = self.STANDBY
+                            ))
+                    else:
+                        self._to_syslog("Master Level INFO", "Configured Master priority value matches the current set of {value}".format(
+                            value = self.MASTER
+                        ))
+            else:
+                self._to_syslog("Master Level Update", "Setting the Master priority level back to the default of {value} from {old}".format(
+                    value = DEFAULT_MASTER,
+                    old = self.MASTER
+                ))
+                self.MASTER = DEFAULT_MASTER
+                self.agentMgr_.status_set("Master-Priority", str(self.MASTER))
+        elif optionName.lower() == "standby":
+            if value:
+                try:
+                    value = int(value)
+                except ValueError:
+                    self._to_syslog("Option Error", "The value for {name} is not of type integer, {value}".format(
+                        name = optionName,
+                        value = value
+                    ))
+                if type(value) == int:
+                    if value != self.STANDBY:
+                        if value < self.MASTER:
+                            self._to_syslog("INFO", "Standby priority level {standby} is lower than current master level {master}".format(
+                                master = self.MASTER,
+                                standby = value
+                            ))
+                            self._to_syslog("Standby Level Update", "Standby priority value is being updated from {old} to {new}".format(
+                                old = self.STANDBY,
+                                new = value
+                            ))
+                            self.STANDBY = value
+                            self.agentMgr_.status_set("Standby-Priority", str(self.STANDBY))
+                        else:
+                            self._to_syslog("Standby LEVEL INFO", "The configured standby level priority {standby} is higher than the current master of {master}".format(
+                                standby = value,
+                                master = self.MASTER
+                            ))
+                    else:
+                        self._to_syslog("Standby Level INFO", "Configured Standby priority value matches the current set of {value}".format(
+                            value = self.STANDBY
+                        ))
+            else:
+                self._to_syslog("Standby Level Update", "Setting the Standby priority level back to the default of {value} from {old}".format(
+                    value = DEFAULT_STANDBY,
+                    old = self.STANDBY
+                ))
+                self.STANDBY = DEFAULT_STANDBY
+                self.agentMgr_.status_set("Standby-Priority", str(self.STANDBY))
+        #Section to evaluate devices to be monitored
+        else:
+            new_device = True
+            #Section to remove a device from monitoring
+            if not value:
+                self._to_syslog("INFO", 'Remove %s'%optionName)
+                self._remove_status(optionName)
+            else:
+                # Verify that the value is a valid IPv4 Address
+                _node_ip = self.verify_ip_addr(value)
+                if _node_ip:
+                    #Section to interate through and make sure it is a new device
+                    if ALL_DEVICES:
+                        if optionName in ALL_DEVICES:
+                            if ALL_DEVICES[optionName].ip != '':
+                                new_device = False
+                        if new_device:
+                            ALL_DEVICES[optionName] = DEVICEMON(optionName, value)
+                        else:
+                            ALL_DEVICES[optionName].ip = value
+                    #If ALL_DEVICES list is empty, add the device into the list
+                    else:
+                        ALL_DEVICES[optionName] = DEVICEMON(optionName, value)
+                else:
+                    self._to_syslog("Address ERROR", "{node} destination does not have a valid IPv4 Address, Provided: {ip}".format(
+                        node = optionName,
+                        ip = value
+                    ))
+
+    def on_timeout(self):
+        #Time to wait until it retries to ping defined hosts
+        #Checks to make sure there are configured devices
+        if ALL_DEVICES:
+            for _host in ALL_DEVICES:
+                host = ALL_DEVICES[_host]
+                #Ping the remote device
+                if host.ip:
+                    ping_result = self._ping_host(host.ip)
+                    #If host is un-reachable
+                    if ping_result == 6:
+                        self._to_syslog("ERROR", "Error in trying to PING {node}".format(
+                            node = host.device
+                        ))
+                    elif ping_result:
+                        old_count = host.failed
+                        host.increase_failure()
+                        #If first failure, grab the current date and time
+                        if old_count == 0:
+                            host.set_failure()
+                        #Delete out the current status msg, so the show daemon output doesn't fill up
+                        if host.status_msg:
+                            self.agentMgr_.status_del(host.status_msg)
+                            host.del_msg()
+                        #Set the daemon status output to when the device has been down since ie 1st fail
+                        host.set_msg("{node} has been DOWN since:".format(
+                            node = host.device
+                        ))
+                        self.agentMgr_.status_set(host.status_msg,host.first_fail)
+                        host.reset_success()
+                        if host.failed < self.PING_THRESHOLD:
+                            self._to_syslog("INFO", '{node} on {ip} has Failed counter {fail}'.format(
+                                node = host.device,
+                                ip = host.ip,
+                                fail = host.failed
+                            ))
+                        else:
+                            self._to_syslog("INFO", '{node} on {ip} has Failed over {fail} times!'.format(
+                                node = host.device,
+                                ip = host.ip,
+                                fail = self.PING_THRESHOLD
+                            ))
+                    #Section if host is reachable via ping
+                    else:
+                        #If it's the first success, set date and time
+                        if not host.first_success:
+                            self._to_syslog("INFO", '{node} on {ip} is UP'.format(
+                                node = host.device,
+                                ip = host.ip
+                            ))
+                            host.set_success()
+                        #If host previously failed, set new first success time and delete old status msg
+                        if host.failed > 0:
+                            self._to_syslog("INFO", '{node} on {ip} is UP'.format(
+                                node = host.device,
+                                ip = host.ip
+                            ))
+                            host.set_success()
+                        if host.status_msg:
+                            self.agentMgr_.status_del(host.status_msg)
+                            host.del_msg()
+                        #reset the host failed count to 0
+                        host.reset_failed()
+                        # Increase success count
+                        host.increase_success()
+                        #Only set the up since status msg if it was previously failed, updates only once
+                        if not host.status_msg:
+                            host.set_msg("{node} has been up since:".format(
+                                node = host.device
+                            ))
+                            self.agentMgr_.status_set(host.status_msg,host.first_success)
+                    #Check if the total failed count is eq to the set threshold
+                    _tmp_cmds = []
+                    _check_vrrp = False
+                    if host.failed == self.PING_THRESHOLD:
+                        _check_vrrp = True
+                        self._to_syslog("INFO", '{node} on {ip} has failed {threshold} consecutive ping tests'.format(
+                            node = host.device,
+                            ip = host.ip,
+                            threshold = self.PING_THRESHOLD
+                        ))
+                        # TODO Add logic to adjust VRRP priority
+                        for vlan in ALL_VLANS:
+                            _vlan = ALL_VLANS[vlan]
+                            _tmp_cmds.append("interface vlan{id}".format(
+                                id = _vlan.vlan_id.replace("vlan", "")
+                            ))
+                            _tmp_cmds.append("vrrp {id} priority-level {level}".format(
+                                id = _vlan.vrrp_id,
+                                level = self.STANDBY
+                            ))
+                            self._to_syslog("UPDATE", "Setting the VRRP priority to {level} for VLAN {vlan}".format(
+                                level = self.STANDBY,
+                                vlan = vlan.replace("vlan", "")
+                            ))
+                        if _tmp_cmds:
+                            if self.setPriority(_tmp_cmds):
+                                self._to_syslog("OK", "Updates made to VRRP/VLANs priority levels to level {level}".format(
+                                    level = self.STANDBY
+                                ))
+                    elif host.success == self.PING_THRESHOLD:
+                        _check_vrrp = True
+                        self._to_syslog("INFO", '{node} on {ip} has been up for {threshold} consecutive ping tests'.format(
+                            node = host.device,
+                            ip = host.ip,
+                            threshold = self.PING_THRESHOLD
+                        ))
+                        # TODO Add logic to adjust VRRP priority
+                        for vlan in ALL_VLANS:
+                            _vlan = ALL_VLANS[vlan]
+                            _tmp_cmds.append("interface vlan{id}".format(
+                                id = _vlan.vlan_id.replace("vlan", "")
+                            ))
+                            _tmp_cmds.append("vrrp {id} priority-level {level}".format(
+                                id = _vlan.vrrp_id,
+                                level = self.MASTER
+                            ))
+                            self._to_syslog("UPDATE", "Setting the VRRP priority to {level} for VLAN {vlan}".format(
+                                    level = self.MASTER,
+                                    vlan = vlan.replace("vlan", "")
+                                ))
+                        if _tmp_cmds:
+                            if self.setPriority(_tmp_cmds):
+                                self._to_syslog("OK", "Updates made to VRRP/VLANs priority levels to level {level}".format(
+                                    level = self.MASTER
+                                ))
+                    if _check_vrrp:
+                        # Add in a delay to wait before checking VRRP status
+                        time.sleep(DEFAULT_DELAY)
+                        for vlan in ALL_VLANS:
+                            _vlan = ALL_VLANS[vlan]
+                            status = self.get_vrrp_status(_vlan.vlan_id, _vlan.vrrp_id)
+                            if not status:
+                                status = "Not Active"
+                            self.agentMgr_.status_set(vlan, status)
+                            self._to_syslog("INFO", "VRRP for VLAN {vlan} is currently {status}".format(
+                                vlan = vlan.replace("vlan", ""),
+                                status = status
+                            ))
+                            _vlan.status = status
+                            ALL_VLANS[vlan] = _vlan
+                    # Update data for object
+                    ALL_DEVICES[_host] = host
+        #Start the poller timeout via EOS SDK
+        self.timeout_time_is(eossdk.now() + self.POLL_TIME)
+
+    def get_vrrp_status(self, _vlan_id, _vrrp_group):
+        """
+        Function to get the current VRRP status for a vlan
+        Parameters:
+        _vlan_id = VLAN ID to query
+        """
+        response = self.eapiMgr_.run_show_cmd("show vrrp interface vlan {id} group {group}".format(
+            id = _vlan_id.replace("vlan", ""),
+            group = _vrrp_group
+        ))
+        # self._to_syslog("DEBUG", str(response.to_string()))
+        if response.success():
+            json_response = json.loads(response.responses()[0])
+            if json_response["virtualRouters"]:
+                return(str(json_response["virtualRouters"][0]["state"]))
+            else:
+                return(False)
+        else:
+            return(False)
+
+    def setPriority(self,eapi_cmds):
+        """
+        Function to set the vrrp priority for a vlan over eAPI
+        """
+        response = self.eapiMgr_.run_config_cmds(eapi_cmds)
+        if response.success():
+            return(True)
+        else:
+            return(False)
+    def verify_ip_addr(self, ip_string):
+        """
+        Function to check if provided IP is valid.
+        Parameters:
+        ip_string = IP Address (10.10.10.10)
+        """
+        self._to_syslog("INFO", "Verifying provided host address of {ip}".format(
+            ip = ip_string
+        ))
+        try:
+            _ip_addr = ipaddress.ip_address(u"{}".format(ip_string))
+            return(_ip_addr)
+        except:
+            return(False)
+
+    def _to_syslog(self, sys_type, sys_msg):
+        syslog.syslog("%%SDK-VRRPIPTrack-6-LOG: {type}: {msg}".format(
+            type = sys_type,
+            msg = sys_msg
+        ))
+
+
+if __name__ == '__main__':
+    syslog.openlog('myIP-MON',0,syslog.LOG_LOCAL4)
+    sdk = eossdk.Sdk()
+    _ = IPMON(sdk.get_agent_mgr(), sdk.get_vrf_mgr(), sdk.get_eapi_mgr())
+    sdk.main_loop(sys.argv)
