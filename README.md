@@ -52,19 +52,19 @@ option threshold value {number_of_failures}
 option vrf value {vrf_name}
 option source value {source_intf}
 ```
-**`master_value` **(optional)** Specify a specific priority level for the node to become the VRRP Master**
+*`master_value` **(optional)** Specify a specific priority level for the node to become the VRRP Master*
 
-**`standby_value` **(optional)** Specify a specific priority level for the node to become the VRRP Backup**
+*`standby_value` **(optional)** Specify a specific priority level for the node to become the VRRP Backup*
 
-**`time_in_seconds` **(optional)** how much time the agent should wait until it tries to poll the IP addresses**
+*`time_in_seconds` **(optional)** how much time the agent should wait until it tries to poll the IP addresses*
 
-**`number_of_failures` **(optional)** how many failures should occur consecutively before an action is triggered**
+*`number_of_failures` **(optional)** how many failures should occur consecutively before an action is triggered*
 
-**`email_address` **(required for email alerting)** the email address for the agent to send an alert if the threshold has been reached**
+*`email_address` **(required for email alerting)** the email address for the agent to send an alert if the threshold has been reached*
 
-**`vrf_name` **(optional)** the name of the VRF that the pings should originate from (VRF name is case-sensitive)**
+*`vrf_name` **(optional)** the name of the VRF that the pings should originate from (VRF name is case-sensitive)*
 
-**`source_intf` **(optional)** interface to source ping from. ie `et44, et49_1, ma1, vlan100` See conversion list below for interface mappings**
+*`source_intf` **(optional)** interface to source ping from. ie `et44, et49_1, ma1, vlan100` See conversion list below for interface mappings*
 
 ##### Interface Mappings
 - et44 --> Ethernet44
@@ -78,11 +78,11 @@ config
 daemon VRRPIPTracking
 option {device_name} value {ip_of_device}
 ```
-**`device_name` needs to be a unique identifier for each remote switch/device**
+*`device_name` needs to be a unique identifier for each remote switch/device*
 
-**`ip_of_device` needs to be a valid IPv4 address for the remote device for monitoring**
+*`ip_of_device` needs to be a valid IPv4 address for the remote device for monitoring*
 
-**To see what unique peer identifiers have been created, enter `show daemon IpMon`**
+**To see what unique peer identifiers have been created, enter `show daemon VRRPIPTracking`**
 
 Example of a full `daemon VRRPIPTracking` config would look like with all parameters specified
 ```
