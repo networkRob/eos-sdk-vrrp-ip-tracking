@@ -1,6 +1,6 @@
 Summary: VRRPIPTracking
 Name: VRRPIPTracking
-Version: 0.2.0
+Version: 0.2.2
 Release: 1
 License: Arista Networks
 Group: EOS/Extension

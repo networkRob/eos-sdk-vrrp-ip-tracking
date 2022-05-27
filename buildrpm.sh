@@ -11,7 +11,7 @@ done
 
 APP=$name
 PROJECT='eos-sdk-vrrp-ip-tracking'
-DUT='l3-l11.networkrob.com'
+DUT='h-lab-01.networkrob.com'
 echo "Creating RPM Directories"
 mkdir -p rpmbuild/SOURCES
 mkdir -p rpmbuild/RPM

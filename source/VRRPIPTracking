@@ -188,11 +188,12 @@ class IPMON(eossdk.AgentHandler,eossdk.TimeoutHandler, eossdk.VrfHandler, eossdk
                 self.POLL_TIME = DEFAULT_POLL
         elif optionName.lower() == 'vrf':
             if value:
-                if self.VRFMgr_.exists(value):
+                if self.vrfMgr_.exists(value):
                     self._to_syslog("INFO", "VRF {vrf} is already available and configured.".format(
                         vrf = value
                     ))
                     self._to_syslog("INFO", "VRF value changed from %s to %s"%(self.VRF,value))
+                    self.agentMgr_.status_set("VRF", str(value))
                     if 'ns-' not in value:
                         value = 'ns-' + value
                     self.VRF = value
@@ -206,6 +207,7 @@ class IPMON(eossdk.AgentHandler,eossdk.TimeoutHandler, eossdk.VrfHandler, eossdk
                     new = DEFAULT_VRF
                 ))
                 self.VRF = DEFAULT_VRF
+                self.agentMgr_.status_set("VRF", str(self.VRF))
         elif optionName.lower() == 'source':
             if value:
                 self._to_syslog("INFO", "Source Interface value changed from {old} to {new}".format(
