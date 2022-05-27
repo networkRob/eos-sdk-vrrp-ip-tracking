@@ -5,3 +5,4 @@ release/
 extension/
 .devcontainer/src/eossdk.py
 manifest.txt
+Issues/
